@@ -33,6 +33,7 @@ import seaborn as sns
 import json
 import os
 from collections import defaultdict
+import networkx as nx
 
 # Add this to store live traffic data
 traffic_queue = queue.Queue()
@@ -831,6 +832,229 @@ def get_historical_trends(days=30):
         print(f"Error analyzing historical trends: {str(e)}")
         return None
 
+def create_network_graph(data):
+    """Create interactive network visualization"""
+    try:
+        # Create graph
+        G = nx.Graph()
+        valid_connections = 0
+        
+        # Track statistics for the info box
+        stats = {
+            'max_threat': 0,
+            'avg_threat': 0,
+            'total_threats': 0,
+            'high_risk_ips': set()
+        }
+        
+        # Add nodes and edges from traffic data
+        for idx, row in data.iterrows():
+            try:
+                src = str(row['Src IP']).strip()
+                dst = str(row['Dst IP']).strip()
+                threat_score = float(row['threat_score'])
+                
+                # Update statistics
+                stats['total_threats'] += threat_score
+                stats['max_threat'] = max(stats['max_threat'], threat_score)
+                if threat_score > 70:  # High risk threshold
+                    stats['high_risk_ips'].add(src)
+                
+                # Skip invalid entries
+                if not src or not dst or src == 'nan' or dst == 'nan':
+                    continue
+                
+                # Add nodes with attributes
+                G.add_node(src, node_type='source', threat_score=threat_score)
+                G.add_node(dst, node_type='destination')
+                
+                # Add edge with threat score as weight
+                G.add_edge(src, dst, weight=threat_score)
+                valid_connections += 1
+                
+            except Exception as e:
+                print(f"Error processing row {idx}: {str(e)}")
+                continue
+        
+        if valid_connections == 0:
+            return None
+            
+        # Calculate average threat score
+        stats['avg_threat'] = stats['total_threats'] / valid_connections
+        
+        # Create layout with more spacing
+        pos = nx.spring_layout(G, k=2, iterations=50)
+        
+        # Create edge traces with improved color gradient
+        edge_traces = []
+        max_threat = max([G.edges[edge]['weight'] for edge in G.edges()])
+        min_threat = min([G.edges[edge]['weight'] for edge in G.edges()])
+        
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            weight = G.edges[edge]['weight']
+            
+            # Calculate color based on threat score
+            if max_threat == min_threat:
+                color = 'rgb(255,0,0)'
+            else:
+                normalized = (weight - min_threat) / (max_threat - min_threat)
+                # Enhanced color gradient: blue -> yellow -> red
+                if normalized < 0.5:
+                    # Blue to yellow
+                    blue_to_yellow = normalized * 2
+                    color = f'rgb({int(255*blue_to_yellow)},{int(255*blue_to_yellow)},{255})'
+                else:
+                    # Yellow to red
+                    yellow_to_red = (normalized - 0.5) * 2
+                    color = f'rgb(255,{int(255*(1-yellow_to_red))},0)'
+            
+            edge_trace = go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                line=dict(width=2, color=color),
+                hoverinfo='text',
+                text=f"Connection: {edge[0]} → {edge[1]}<br>Threat Score: {weight:.2f}",
+                mode='lines'
+            )
+            edge_traces.append(edge_trace)
+        
+        # Create node trace with enhanced information
+        node_x = []
+        node_y = []
+        node_text = []
+        node_color = []
+        node_size = []
+        node_symbols = []
+        
+        for node in G.nodes():
+            x, y = pos[node]
+            node_x.append(x)
+            node_y.append(y)
+            
+            # Calculate node size based on connections and threat
+            connections = len(list(G.neighbors(node)))
+            base_size = 25 + (connections * 15)
+            
+            if G.nodes[node]['node_type'] == 'source':
+                threat = G.nodes[node].get('threat_score', 0)
+                # Increase size for high-threat nodes
+                node_size.append(base_size * (1 + threat/100))
+                node_color.append('#FF4444')
+                node_symbols.append('diamond')
+                node_text.append(
+                    f'Source IP: {node}<br>'
+                    f'Connections: {connections}<br>'
+                    f'Threat Score: {threat:.2f}'
+                )
+            else:
+                node_size.append(base_size)
+                node_color.append('#4444FF')
+                node_symbols.append('circle')
+                node_text.append(
+                    f'Destination IP: {node}<br>'
+                    f'Incoming Connections: {connections}'
+                )
+        
+        node_trace = go.Scatter(
+            x=node_x, y=node_y,
+            mode='markers',
+            hoverinfo='text',
+            text=node_text,
+            marker=dict(
+                color=node_color,
+                size=node_size,
+                symbol=node_symbols,
+                line=dict(width=2, color='white'),
+                sizemode='diameter'
+            ))
+        
+        # Create figure with enhanced layout
+        fig = go.Figure(
+            data=[*edge_traces, node_trace],
+            layout=go.Layout(
+                title=dict(
+                    text='Network Traffic Visualization',
+                    x=0.5,
+                    y=0.95,
+                    font=dict(size=24)
+                ),
+                showlegend=False,
+                hovermode='closest',
+                margin=dict(b=20,l=5,r=5,t=40),
+                annotations=[
+                    dict(
+                        text=f"High Risk IPs: {len(stats['high_risk_ips'])}",
+                        x=0.02,
+                        y=0.98,
+                        showarrow=False,
+                        font=dict(size=12, color='red')
+                    ),
+                    dict(
+                        text=f"Avg Threat: {stats['avg_threat']:.2f}",
+                        x=0.02,
+                        y=0.95,
+                        showarrow=False,
+                        font=dict(size=12, color='black')
+                    ),
+                    dict(
+                        text="Source IPs (◆)",
+                        x=0.95,
+                        y=0.98,
+                        showarrow=False,
+                        font=dict(size=12, color='#FF4444')
+                    ),
+                    dict(
+                        text="Destination IPs (●)",
+                        x=0.95,
+                        y=0.95,
+                        showarrow=False,
+                        font=dict(size=12, color='#4444FF')
+                    )
+                ],
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                plot_bgcolor='#F8F9FA',
+                paper_bgcolor='white',
+                width=900,
+                height=700,
+                dragmode='pan'  # Enable panning
+            )
+        )
+        
+        # Add zoom buttons
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    showactive=False,
+                    x=0.1,
+                    y=1.1,
+                    buttons=[
+                        dict(
+                            label="Reset View",
+                            method="relayout",
+                            args=[{"xaxis.range": None, "yaxis.range": None}]
+                        ),
+                        dict(
+                            label="Zoom In",
+                            method="relayout",
+                            args=[{"xaxis.range": [-0.5, 0.5], "yaxis.range": [-0.5, 0.5]}]
+                        )
+                    ]
+                )
+            ]
+        )
+        
+        return fig
+        
+    except Exception as e:
+        print(f"Error creating network graph: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 def main():
     # Initialize session state at the very beginning
     initialize_session_state()
@@ -869,7 +1093,7 @@ def main():
     st.sidebar.title("🛡️ Network IDS")
     page = st.sidebar.selectbox(
         "Navigation",
-        ["Dashboard", "Model Training", "Real-time Monitoring", "Batch Analysis", "System Settings", "Reports & Analytics"]
+        ["Dashboard", "Model Training", "Real-time Monitoring", "Batch Analysis", "System Settings", "Reports & Analytics", "Network Visualization"]
     )
     
     # Add new pages to navigation
@@ -1056,7 +1280,25 @@ def main():
                 predictions, enriched_data = monitor_traffic(prepared_data, model, scaler)
                 
                 if predictions is not None and enriched_data is not None:
+                    # Store for historical analysis
+                    store_historical_data(enriched_data)
+                    
+                    # Update session state
+                    st.session_state.current_data = enriched_data
+                    
+                    # Show analysis results
                     show_threat_intel_dashboard(enriched_data)
+                    
+                    # Add report generation option
+                    if st.button("Generate Analysis Report"):
+                        pdf_buffer = generate_pdf_report(enriched_data)
+                        if pdf_buffer:
+                            st.download_button(
+                                "Download Analysis Report",
+                                data=pdf_buffer,
+                                file_name=f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                mime="application/pdf"
+                            )
                 else:
                     st.error("Error processing the data. Check the console for details.")
             else:
@@ -1269,6 +1511,65 @@ def main():
                 No data available for pattern analysis. 
                 Please run monitoring or batch analysis first.
                 """)
+
+    elif page == "Network Visualization":
+        st.title("Network Traffic Visualization")
+        
+        if 'current_data' in st.session_state and st.session_state.current_data is not None:
+            # Show data summary
+            st.sidebar.markdown("### Data Summary")
+            st.sidebar.write(f"Total records: {len(st.session_state.current_data)}")
+            
+            # Show sample of the data
+            st.sidebar.markdown("### Sample Data")
+            st.sidebar.dataframe(
+                st.session_state.current_data[['Src IP', 'Dst IP', 'threat_score']].head(),
+                hide_index=True
+            )
+            
+            try:
+                # Create visualization with all data
+                with st.spinner("Generating network visualization..."):
+                    fig = create_network_graph(st.session_state.current_data)
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Add statistics
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric(
+                                "Total Connections",
+                                len(st.session_state.current_data)
+                            )
+                        with col2:
+                            st.metric(
+                                "Unique Sources",
+                                st.session_state.current_data['Src IP'].nunique()
+                            )
+                        with col3:
+                            st.metric(
+                                "Unique Destinations",
+                                st.session_state.current_data['Dst IP'].nunique()
+                            )
+                        
+                        # Show data table
+                        st.markdown("### Connection Details")
+                        st.dataframe(
+                            st.session_state.current_data[['Src IP', 'Dst IP', 'threat_score']],
+                            hide_index=True
+                        )
+                    else:
+                        st.error("Could not generate visualization. Check the logs for details.")
+                    
+            except Exception as e:
+                st.error(f"Error processing data: {str(e)}")
+                st.write("Please check the application logs for more details.")
+            
+        else:
+            st.warning("""
+            No data available for visualization. 
+            Please run monitoring or batch analysis first to generate traffic data.
+            """)
 
     # Handle new pages
     if st.session_state.get('current_page') == "change_password":
