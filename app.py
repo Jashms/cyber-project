@@ -19,6 +19,20 @@ from auth.two_factor import generate_totp_secret, generate_totp_uri, generate_qr
 from threat_intel.intel_feeds import ThreatIntel
 from model_training_dl import DeepIDS
 from deep_predictor import DeepPredictor
+import requests
+import folium
+from folium import plugins
+import streamlit.components.v1 as components
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from io import BytesIO
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+import os
+from collections import defaultdict
 
 # Add this to store live traffic data
 traffic_queue = queue.Queue()
@@ -480,6 +494,343 @@ def validate_and_prepare_data(data):
         traceback.print_exc()
         return None
 
+def get_ip_location(ip):
+    """Get location information for an IP address"""
+    try:
+        # Skip private/local IP addresses
+        if ip.startswith(('192.168.', '10.', '172.', '127.')):
+            return None
+            
+        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            # Validate that we have both latitude and longitude
+            if data.get('latitude') is not None and data.get('longitude') is not None:
+                return {
+                    'latitude': float(data.get('latitude')),
+                    'longitude': float(data.get('longitude')),
+                    'country': data.get('country_name', 'Unknown'),
+                    'city': data.get('city', 'Unknown'),
+                    'threat_data': {}
+                }
+    except Exception as e:
+        print(f"Error getting location for IP {ip}: {str(e)}")
+    return None
+
+def create_attack_map(enriched_data):
+    """Create an interactive map showing attack origins"""
+    try:
+        # Create base map
+        m = folium.Map(location=[0, 0], zoom_start=2)
+        
+        # Create marker cluster
+        marker_cluster = plugins.MarkerCluster().add_to(m)
+        
+        # Track unique attack locations
+        attack_locations = {}
+        valid_locations = False
+        
+        # Process each suspicious/malicious connection
+        for _, row in enriched_data[enriched_data['threat_score'] > 50].iterrows():
+            src_ip = row['Src IP']
+            if src_ip not in attack_locations:
+                location_data = get_ip_location(src_ip)
+                if location_data and location_data.get('latitude') is not None:
+                    attack_locations[src_ip] = location_data
+                    valid_locations = True
+                    
+                    # Create popup content
+                    popup_content = f"""
+                        <b>IP:</b> {src_ip}<br>
+                        <b>Location:</b> {location_data['city']}, {location_data['country']}<br>
+                        <b>Threat Score:</b> {row['threat_score']}<br>
+                        <b>Attack Type:</b> {row.get('threat_categories', 'Unknown')}
+                    """
+                    
+                    # Add marker to cluster
+                    folium.Marker(
+                        location=[location_data['latitude'], location_data['longitude']],
+                        popup=popup_content,
+                        icon=folium.Icon(color='red', icon='info-sign')
+                    ).add_to(marker_cluster)
+        
+        if not valid_locations:
+            return None
+            
+        # Add heat map layer if we have valid locations
+        heat_data = [
+            [loc['latitude'], loc['longitude']] 
+            for loc in attack_locations.values() 
+            if loc['latitude'] is not None and loc['longitude'] is not None
+        ]
+        if heat_data:
+            plugins.HeatMap(heat_data).add_to(m)
+        
+        return m
+        
+    except Exception as e:
+        print(f"Error creating map: {str(e)}")
+        return None
+
+def show_attack_map(enriched_data):
+    """Display the attack map in Streamlit"""
+    try:
+        # Create map
+        attack_map = create_attack_map(enriched_data)
+        
+        if attack_map is None:
+            st.warning("No valid geolocation data available for mapping. This could be due to:")
+            st.markdown("""
+                - Local/private IP addresses in the traffic
+                - Geolocation service rate limits
+                - Network connectivity issues
+                - Invalid IP addresses in the data
+            """)
+            return
+            
+        # Save map to HTML string
+        map_html = attack_map._repr_html_()
+        
+        # Display using components
+        components.html(map_html, height=400)
+        
+    except Exception as e:
+        st.error(f"Error displaying map: {str(e)}")
+
+def generate_pdf_report(data, report_type="incident"):
+    """Generate a PDF report with graphs and statistics"""
+    try:
+        # Create a BytesIO buffer to store the PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Add title
+        title = f"Security Analysis Report - {datetime.now().strftime('%Y-%m-%d')}"
+        story.append(Paragraph(title, styles['Heading1']))
+        story.append(Spacer(1, 12))
+
+        # Add summary statistics
+        summary_data = [
+            ["Total Traffic Analyzed", str(len(data))],
+            ["High Threat Events", str(len(data[data['threat_score'] > 80]))],
+            ["Unique Source IPs", str(data['Src IP'].nunique())],
+            ["Average Threat Score", f"{data['threat_score'].mean():.2f}"]
+        ]
+
+        summary_table = Table(summary_data)
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 14),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 20))
+
+        # Generate and add graphs
+        # Threat Score Distribution
+        plt.figure(figsize=(10, 6))
+        sns.histplot(data=data, x='threat_score', bins=20)
+        plt.title('Threat Score Distribution')
+        img_buffer = BytesIO()
+        plt.savefig(img_buffer)
+        img_buffer.seek(0)
+        story.append(Image(img_buffer))
+        plt.close()
+
+        # Add attack patterns if available
+        if 'dl_prediction' in data.columns:
+            story.append(Paragraph('Attack Pattern Distribution', styles['Heading2']))
+            attack_counts = data['dl_prediction'].value_counts()
+            attack_data = [[str(k), str(v)] for k, v in attack_counts.items()]
+            attack_table = Table([['Attack Type', 'Count']] + attack_data)
+            attack_table.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ]))
+            story.append(attack_table)
+
+        # Build PDF
+        doc.build(story)
+        buffer.seek(0)
+        return buffer
+
+    except Exception as e:
+        print(f"Error generating PDF report: {str(e)}")
+        return None
+
+def analyze_attack_patterns(data):
+    """Analyze and identify common attack patterns"""
+    patterns = defaultdict(int)
+    attack_sequences = []
+    
+    try:
+        # Look for patterns in traffic behavior
+        for i in range(len(data)):
+            if data.iloc[i]['threat_score'] > 50:  # Focus on suspicious traffic
+                pattern = {
+                    'src_ip': data.iloc[i]['Src IP'],
+                    'dst_ip': data.iloc[i]['Dst IP'],
+                    'packets_per_sec': float(data.iloc[i]['Flow Packets/s']),
+                    'bytes_per_sec': float(data.iloc[i]['Flow Bytes/s']),
+                    'threat_score': float(data.iloc[i]['threat_score'])
+                }
+                
+                # Add threat categories if available
+                if 'threat_categories' in data.columns:
+                    pattern['threat_type'] = data.iloc[i]['threat_categories']
+                
+                # Add deep learning predictions if available
+                if 'dl_prediction' in data.columns:
+                    pattern['dl_prediction'] = data.iloc[i]['dl_prediction']
+                
+                attack_sequences.append(pattern)
+                
+                # Create a simplified pattern key for counting occurrences
+                pattern_key = f"SRC:{pattern['src_ip']}_DST:{pattern['dst_ip']}"
+                patterns[pattern_key] += 1
+        
+        # Analyze attack sequences
+        analyzed_patterns = []
+        for pattern_key, count in patterns.items():
+            # Get all sequences matching this pattern
+            matching_sequences = [
+                seq for seq in attack_sequences 
+                if f"SRC:{seq['src_ip']}_DST:{seq['dst_ip']}" == pattern_key
+            ]
+            
+            if matching_sequences:
+                # Calculate average metrics
+                avg_packets = sum(seq['packets_per_sec'] for seq in matching_sequences) / len(matching_sequences)
+                avg_bytes = sum(seq['bytes_per_sec'] for seq in matching_sequences) / len(matching_sequences)
+                avg_threat = sum(seq['threat_score'] for seq in matching_sequences) / len(matching_sequences)
+                
+                # Get the most common threat type if available
+                threat_types = [
+                    seq.get('threat_type', 'Unknown') 
+                    for seq in matching_sequences 
+                    if seq.get('threat_type')
+                ]
+                most_common_threat = max(set(threat_types), key=threat_types.count) if threat_types else 'Unknown'
+                
+                analyzed_patterns.append({
+                    'pattern_key': pattern_key,
+                    'count': count,
+                    'src_ip': matching_sequences[0]['src_ip'],
+                    'dst_ip': matching_sequences[0]['dst_ip'],
+                    'avg_packets_per_sec': avg_packets,
+                    'avg_bytes_per_sec': avg_bytes,
+                    'avg_threat_score': avg_threat,
+                    'threat_type': most_common_threat,
+                    'dl_prediction': matching_sequences[0].get('dl_prediction', 'Unknown')
+                })
+        
+        # Sort by count and threat score
+        analyzed_patterns.sort(key=lambda x: (x['count'], x['avg_threat_score']), reverse=True)
+        return analyzed_patterns
+        
+    except Exception as e:
+        print(f"Error in attack pattern analysis: {str(e)}")
+        return []
+
+def store_historical_data(data):
+    """Store traffic data for historical analysis"""
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'historical_data_{timestamp}.json'
+        
+        # Add debug print statements
+        print(f"Storing historical data with {len(data)} records")
+        
+        # Prepare data for storage
+        historical_data = {
+            'timestamp': timestamp,
+            'traffic_summary': {
+                'total_connections': len(data),
+                'unique_sources': data['Src IP'].nunique(),
+                'unique_destinations': data['Dst IP'].nunique(),
+                'avg_threat_score': float(data['threat_score'].mean()),
+                'high_threat_events': int(sum(data['threat_score'] > 80))
+            },
+            'attack_patterns': analyze_attack_patterns(data)
+        }
+        
+        # Create directory if it doesn't exist
+        os.makedirs('historical_data', exist_ok=True)
+        
+        # Save to file
+        filepath = f'historical_data/{filename}'
+        with open(filepath, 'w') as f:
+            json.dump(historical_data, f)
+            
+        print(f"Successfully stored data to {filepath}")
+        return True
+    except Exception as e:
+        print(f"Error storing historical data: {str(e)}")
+        return False
+
+def get_historical_trends(days=30):
+    """Analyze historical trends from stored data"""
+    try:
+        trends = {
+            'dates': [],
+            'total_traffic': [],
+            'threat_scores': [],
+            'attack_patterns': defaultdict(list)
+        }
+        
+        # Debug print
+        print("Checking for historical data...")
+        
+        # Ensure directory exists
+        if not os.path.exists('historical_data'):
+            print("Historical data directory not found")
+            return None
+        
+        # Get list of historical data files
+        historical_files = sorted(os.listdir('historical_data'))
+        print(f"Found {len(historical_files)} historical data files")
+        
+        # Filter files for specified date range
+        start_date = datetime.now() - timedelta(days=days)
+        
+        for filename in historical_files:
+            try:
+                file_date = datetime.strptime(filename.split('_')[1], '%Y%m%d')
+                if file_date >= start_date:
+                    filepath = f'historical_data/{filename}'
+                    print(f"Processing file: {filepath}")
+                    
+                    with open(filepath, 'r') as f:
+                        data = json.load(f)
+                        trends['dates'].append(file_date.strftime('%Y-%m-%d'))
+                        trends['total_traffic'].append(data['traffic_summary']['total_connections'])
+                        trends['threat_scores'].append(data['traffic_summary']['avg_threat_score'])
+                        
+                        # Track attack patterns
+                        for pattern, count in data['attack_patterns']:
+                            trends['attack_patterns'][pattern].append(count)
+            except Exception as e:
+                print(f"Error processing file {filename}: {str(e)}")
+                continue
+        
+        print(f"Processed {len(trends['dates'])} days of historical data")
+        return trends if trends['dates'] else None
+    
+    except Exception as e:
+        print(f"Error analyzing historical trends: {str(e)}")
+        return None
+
 def main():
     # Initialize session state at the very beginning
     initialize_session_state()
@@ -518,7 +869,7 @@ def main():
     st.sidebar.title("🛡️ Network IDS")
     page = st.sidebar.selectbox(
         "Navigation",
-        ["Dashboard", "Model Training", "Real-time Monitoring", "Batch Analysis", "System Settings"]
+        ["Dashboard", "Model Training", "Real-time Monitoring", "Batch Analysis", "System Settings", "Reports & Analytics"]
     )
     
     # Add new pages to navigation
@@ -611,6 +962,14 @@ def main():
                 predictions, enriched_data = monitor_traffic(sample_data, model, scaler)
                 
                 if predictions is not None and enriched_data is not None:
+                    # Store the data for historical analysis
+                    success = store_historical_data(enriched_data)
+                    if success:
+                        st.session_state.current_data = enriched_data
+                        print("Successfully stored monitoring data")
+                    else:
+                        print("Failed to store monitoring data")
+                    
                     # Update display
                     with placeholder.container():
                         col1, col2 = st.columns(2)
@@ -725,6 +1084,191 @@ def main():
         
         if st.button("Export System Logs"):
             st.info("System logs exported successfully!")
+
+    elif page == "Reports & Analytics":
+        st.title("Reports & Analytics Dashboard")
+        
+        # Debug information
+        st.sidebar.markdown("### Debug Information")
+        if os.path.exists('historical_data'):
+            files = os.listdir('historical_data')
+            st.sidebar.write(f"Number of historical records: {len(files)}")
+        else:
+            st.sidebar.write("No historical data directory found")
+        
+        # Create tabs for different analytics features
+        tab1, tab2, tab3 = st.tabs([
+            "Generate Reports",
+            "Historical Trends",
+            "Attack Patterns"
+        ])
+        
+        with tab1:
+            st.subheader("Generate Security Reports")
+            
+            # Show current data status
+            if 'current_data' in st.session_state:
+                st.info(f"Current data contains {len(st.session_state.current_data)} records")
+            else:
+                st.warning("No current data available. Please run monitoring or batch analysis first.")
+            
+            report_type = st.selectbox(
+                "Report Type",
+                ["Incident Report", "Weekly Summary", "Monthly Analysis"]
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("Start Date")
+            with col2:
+                end_date = st.date_input("End Date")
+            
+            if st.button("Generate Report"):
+                with st.spinner("Generating report..."):
+                    if 'current_data' in st.session_state:
+                        pdf_buffer = generate_pdf_report(st.session_state.current_data)
+                        if pdf_buffer:
+                            st.download_button(
+                                label="Download Report",
+                                data=pdf_buffer,
+                                file_name=f"security_report_{datetime.now().strftime('%Y%m%d')}.pdf",
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.error("Error generating report")
+                    else:
+                        st.warning("No data available for report generation")
+        
+        with tab2:
+            st.subheader("Historical Trend Analysis")
+            time_range = st.selectbox(
+                "Time Range",
+                ["Last 7 Days", "Last 30 Days", "Last 90 Days"]
+            )
+            
+            days = int(time_range.split()[1])
+            trends = get_historical_trends(days)
+            
+            if trends and trends['dates']:
+                # Plot traffic trends
+                fig1 = px.line(
+                    x=trends['dates'],
+                    y=trends['total_traffic'],
+                    title="Traffic Volume Over Time"
+                )
+                st.plotly_chart(fig1)
+                
+                # Plot threat score trends
+                fig2 = px.line(
+                    x=trends['dates'],
+                    y=trends['threat_scores'],
+                    title="Average Threat Score Over Time"
+                )
+                st.plotly_chart(fig2)
+                
+                # Show raw data
+                st.subheader("Raw Data")
+                data_df = pd.DataFrame({
+                    'Date': trends['dates'],
+                    'Traffic Volume': trends['total_traffic'],
+                    'Average Threat Score': trends['threat_scores']
+                })
+                st.dataframe(data_df)
+            else:
+                st.info("No historical data available for the selected time range")
+                st.markdown("""
+                To generate historical data:
+                1. Run the Real-time Monitoring
+                2. Or perform Batch Analysis
+                3. Data will be automatically stored for analysis
+                """)
+
+        with tab3:
+            st.subheader("Attack Pattern Analysis")
+            if 'current_data' in st.session_state:
+                patterns = analyze_attack_patterns(st.session_state.current_data)
+                
+                if patterns:
+                    st.write("### Detected Attack Patterns")
+                    
+                    # Create tabs for different views
+                    pattern_tab1, pattern_tab2 = st.tabs(["Summary View", "Detailed Analysis"])
+                    
+                    with pattern_tab1:
+                        # Show summary cards for top patterns
+                        for pattern in patterns[:5]:  # Show top 5 patterns
+                            with st.container():
+                                st.markdown(f"""
+                                #### Pattern detected {pattern['count']} times
+                                - **Source IP:** `{pattern['src_ip']}`
+                                - **Destination IP:** `{pattern['dst_ip']}`
+                                - **Average Threat Score:** `{pattern['avg_threat_score']:.2f}`
+                                - **Attack Type:** `{pattern['threat_type']}`
+                                - **Traffic Rate:** `{pattern['avg_packets_per_sec']:.2f}` packets/sec, 
+                                  `{pattern['avg_bytes_per_sec']:.2f}` bytes/sec
+                                """)
+                                st.markdown("---")
+                    
+                    with pattern_tab2:
+                        # Create a DataFrame for all patterns
+                        pattern_df = pd.DataFrame(patterns)
+                        
+                        # Add filters
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            min_occurrences = st.slider(
+                                "Minimum Occurrences",
+                                min_value=1,
+                                max_value=max(pattern_df['count']),
+                                value=2
+                            )
+                        with col2:
+                            min_threat = st.slider(
+                                "Minimum Threat Score",
+                                min_value=0,
+                                max_value=100,
+                                value=50
+                            )
+                        
+                        # Filter and display patterns
+                        filtered_patterns = pattern_df[
+                            (pattern_df['count'] >= min_occurrences) &
+                            (pattern_df['avg_threat_score'] >= min_threat)
+                        ]
+                        
+                        if not filtered_patterns.empty:
+                            st.dataframe(
+                                filtered_patterns[[
+                                    'src_ip', 'dst_ip', 'count', 'avg_threat_score',
+                                    'threat_type', 'avg_packets_per_sec', 'avg_bytes_per_sec'
+                                ]],
+                                hide_index=True
+                            )
+                            
+                            # Visualize pattern distribution
+                            fig = px.bar(
+                                filtered_patterns,
+                                x='src_ip',
+                                y='count',
+                                color='avg_threat_score',
+                                title='Attack Pattern Distribution'
+                            )
+                            st.plotly_chart(fig)
+                        else:
+                            st.info("No patterns match the current filters")
+                else:
+                    st.info("""
+                    No significant attack patterns detected yet. 
+                    This could be because:
+                    - Not enough traffic data collected
+                    - No suspicious activities detected
+                    - Threat scores are below threshold
+                    """)
+            else:
+                st.warning("""
+                No data available for pattern analysis. 
+                Please run monitoring or batch analysis first.
+                """)
 
     # Handle new pages
     if st.session_state.get('current_page') == "change_password":
