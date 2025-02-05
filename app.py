@@ -19,6 +19,9 @@ from auth.two_factor import generate_totp_secret, generate_totp_uri, generate_qr
 from threat_intel.intel_feeds import ThreatIntel
 from model_training_dl import DeepIDS
 from deep_predictor import DeepPredictor
+import shap
+from shap import KernelExplainer, summary_plot
+import matplotlib.pyplot as plt
 
 # Add this to store live traffic data
 traffic_queue = queue.Queue()
@@ -41,6 +44,182 @@ def load_model():
         return model, scaler
     except FileNotFoundError:
         return None, None
+
+def generate_shap_explanations(model, data, scaler, feature_names):
+    """Generate SHAP explanations for model predictions"""
+    try:
+        # Ensure data has all required features
+        for feature in feature_names:
+            if feature not in data.columns:
+                data[feature] = 0
+        
+        # Select and order features to match training data
+        X = data[feature_names].copy()
+        
+        # Print debug information
+        print(f"Feature names: {feature_names}")
+        print(f"Data columns: {X.columns.tolist()}")
+        print(f"Data shape: {X.shape}")
+        
+        # Scale the input data
+        scaled_data = scaler.transform(X)
+        print(f"Scaled data shape: {scaled_data.shape}")
+        
+        # Create a background dataset for SHAP
+        background_data = scaled_data[:100] if len(scaled_data) > 100 else scaled_data
+        
+        # Initialize the SHAP explainer
+        explainer = KernelExplainer(model.predict_proba, background_data)
+        
+        # Calculate SHAP values for a smaller subset
+        max_samples = min(len(scaled_data), 100)
+        shap_values = explainer.shap_values(scaled_data[:max_samples])
+        
+        # Print SHAP values shape
+        print(f"SHAP values shape: {[sv.shape for sv in shap_values]}")
+        print(f"X shape for visualization: {X[:max_samples].shape}")
+        
+        # Ensure the shapes match for visualization
+        shap_values_for_viz = None
+        if isinstance(shap_values, list):
+            shap_values_for_viz = shap_values[1]  # For binary classification, use class 1
+            if shap_values_for_viz.shape[1] != len(feature_names):
+                # Transpose if necessary
+                shap_values_for_viz = shap_values_for_viz.T
+        else:
+            shap_values_for_viz = shap_values
+            if shap_values_for_viz.shape[1] != len(feature_names):
+                # Transpose if necessary
+                shap_values_for_viz = shap_values_for_viz.T
+        
+        return shap_values_for_viz, explainer, X[:max_samples]
+        
+    except Exception as e:
+        st.error(f"Error generating SHAP explanations: {str(e)}")
+        print(f"Full error details: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
+
+def show_xai_analysis(data, model, scaler, predictions):
+    """Display XAI analysis for the predictions"""
+    st.subheader("Explainable AI Analysis")
+    
+    try:
+        # Get feature names
+        with open('feature_names.pkl', 'rb') as f:
+            feature_names = pickle.load(f)
+            print(f"Loaded feature names: {feature_names}")
+    except FileNotFoundError:
+        st.error("Feature names file not found!")
+        return
+    except Exception as e:
+        st.error(f"Error loading feature names: {str(e)}")
+        return
+    
+    # Generate SHAP explanations
+    shap_values, explainer, shap_data = generate_shap_explanations(model, data, scaler, feature_names)
+    
+    if shap_values is not None and shap_data is not None:
+        try:
+            # Create tabs for different XAI visualizations
+            tab1, tab2 = st.tabs(["Feature Importance", "Individual Predictions"])
+            
+            with tab1:
+                st.write("Global Feature Importance")
+                
+                # Calculate global feature importance (mean absolute SHAP values)
+                mean_shap = np.abs(shap_values).mean(axis=0)
+                if mean_shap.ndim > 1:
+                    mean_shap = mean_shap.flatten()
+                
+                # Ensure arrays are the same length
+                min_length = min(len(mean_shap), len(feature_names))
+                mean_shap = mean_shap[:min_length]
+                feature_names_subset = feature_names[:min_length]
+                
+                # Create DataFrame for global importance
+                global_importance = pd.DataFrame({
+                    'Feature': feature_names_subset,
+                    'Importance': mean_shap
+                }).sort_values('Importance', ascending=True)
+                
+                # Plot global importance
+                fig = px.bar(
+                    global_importance,
+                    x='Importance',
+                    y='Feature',
+                    orientation='h',
+                    title='Global Feature Importance'
+                )
+                st.plotly_chart(fig)
+            
+            with tab2:
+                st.write("Individual Prediction Explanation")
+                
+                # Convert predictions to list if it's not already
+                pred_list = predictions.tolist() if isinstance(predictions, np.ndarray) else predictions
+                
+                # Find suspicious traffic indices
+                suspicious_indices = [i for i, pred in enumerate(pred_list[:len(shap_data)]) 
+                                   if pred != "BENIGN"]
+                
+                if suspicious_indices:
+                    # Create selection for suspicious traffic
+                    selected_index = st.selectbox(
+                        "Select suspicious traffic to explain:",
+                        range(len(suspicious_indices)),
+                        format_func=lambda x: f"Traffic {suspicious_indices[x]} ({pred_list[suspicious_indices[x]]})"
+                    )
+                    
+                    if selected_index is not None:
+                        actual_index = suspicious_indices[selected_index]
+                        
+                        # Show feature importance for selected prediction
+                        st.write(f"### Analysis for Traffic {actual_index}")
+                        
+                        # Get SHAP values for selected prediction and ensure it's 1D
+                        local_shap_values = shap_values[actual_index]
+                        if local_shap_values.ndim > 1:
+                            local_shap_values = local_shap_values.flatten()
+                        
+                        # Ensure arrays are the same length
+                        min_length = min(len(local_shap_values), len(feature_names))
+                        local_shap_values = local_shap_values[:min_length]
+                        feature_names_subset = feature_names[:min_length]
+                        
+                        # Create feature importance for selected prediction
+                        local_importance = pd.DataFrame({
+                            'Feature': feature_names_subset,
+                            'Impact': local_shap_values
+                        }).sort_values('Impact', ascending=True)
+                        
+                        # Plot local importance
+                        fig = px.bar(
+                            local_importance,
+                            x='Impact',
+                            y='Feature',
+                            orientation='h',
+                            title=f'Feature Impact for Traffic {actual_index}'
+                        )
+                        st.plotly_chart(fig)
+                        
+                        # Show actual feature values
+                        st.write("### Feature Values")
+                        feature_data = shap_data.iloc[actual_index]
+                        for feat, val in zip(feature_names_subset, feature_data[:min_length]):
+                            st.write(f"**{feat}:** {val:.4f}")
+                else:
+                    st.info("No suspicious traffic detected to explain.")
+                    
+        except Exception as e:
+            st.error(f"Error in visualization: {str(e)}")
+            print(f"Full error details: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+    else:
+        st.error("Could not generate SHAP explanations")
 
 def monitor_traffic(data, model, scaler):
     try:
@@ -135,6 +314,10 @@ def monitor_traffic(data, model, scaler):
                     else:
                         enriched_data.loc[idx, 'threat_categories'] = str(label)
         
+        # Add XAI analysis if predictions indicate suspicious traffic
+        if any(predictions != "BENIGN"):
+            show_xai_analysis(data, model, scaler, predictions)
+        
         return final_predictions, enriched_data
         
     except Exception as e:
@@ -164,8 +347,18 @@ def generate_sample_traffic():
         'Dst Port': [np.random.randint(1, 65535) for _ in range(num_records)],
         'Protocol': [np.random.randint(0, 17) for _ in range(num_records)],
         'Flow Duration': [np.random.randint(0, 1000000) for _ in range(num_records)],
-        'Flow Packets/s': [np.random.randint(1, 5000) for _ in range(num_records)],
-        'Flow Bytes/s': [np.random.randint(1, 100000) for _ in range(num_records)],
+        'Flow Packets/s': [
+            np.random.choice(
+                [np.random.randint(1, 1000), np.random.randint(5000, 10000)],  # Normal vs Suspicious
+                p=[0.7, 0.3]  # 30% chance of suspicious traffic
+            ) for _ in range(num_records)
+        ],
+        'Flow Bytes/s': [
+            np.random.choice(
+                [np.random.randint(1, 50000), np.random.randint(100000, 200000)],  # Normal vs Suspicious
+                p=[0.7, 0.3]  # 30% chance of suspicious traffic
+            ) for _ in range(num_records)
+        ],
         'Total Fwd Packet': [np.random.randint(1, 100) for _ in range(num_records)],
         'Total Bwd packets': [np.random.randint(1, 100) for _ in range(num_records)],
         'Total Length of Fwd Packet': [np.random.randint(0, 10000) for _ in range(num_records)],
@@ -634,6 +827,13 @@ def main():
                             if not sample_data.empty:
                                 st.metric("Packets/sec", f"{sample_data['Flow Packets/s'].mean():.2f}")
                                 st.metric("Bytes/sec", f"{sample_data['Flow Bytes/s'].mean():.2f}")
+                        
+                        # Add XAI Analysis section
+                        st.markdown("---")
+                        st.subheader("🔍 XAI Analysis")
+                        
+                        # Force XAI analysis to show even for normal traffic
+                        show_xai_analysis(sample_data, model, scaler, predictions)
                         
                         # Show threat intelligence dashboard
                         st.markdown("---")
