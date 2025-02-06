@@ -34,6 +34,11 @@ import json
 import os
 from collections import defaultdict
 import networkx as nx
+import logging
+from logging.handlers import RotatingFileHandler
+import psutil
+import platform
+from datetime import timedelta
 
 # Add this to store live traffic data
 traffic_queue = queue.Queue()
@@ -1107,6 +1112,75 @@ def create_network_graph(data):
         traceback.print_exc()
         return None
 
+def setup_logging():
+    """Setup logging configuration"""
+    try:
+        # Create logs directory if it doesn't exist
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+        
+        # Create log formatter
+        log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        
+        # Setup file handler with rotation
+        log_file = 'logs/system_health.log'
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=1024*1024,  # 1MB
+            backupCount=5
+        )
+        file_handler.setFormatter(log_formatter)
+        
+        # Get root logger
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+        
+        # Remove existing handlers to avoid duplicates
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        
+        # Add the file handler
+        logger.addHandler(file_handler)
+        
+        logging.info("Logging system initialized")
+        return logger
+        
+    except Exception as e:
+        print(f"Error setting up logging: {str(e)}")
+        return None
+
+def get_system_metrics():
+    """Get current system metrics"""
+    try:
+        metrics = {
+            'cpu_percent': psutil.cpu_percent(interval=1),
+            'memory_percent': psutil.virtual_memory().percent,
+            'disk_usage': psutil.disk_usage('/').percent,
+            'network_io': psutil.net_io_counters(),
+            'boot_time': datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S"),
+            'python_version': platform.python_version(),
+            'system_platform': platform.system(),
+            'processor': platform.processor()
+        }
+        return metrics
+    except Exception as e:
+        logging.error(f"Error getting system metrics: {str(e)}")
+        return None
+
+def get_process_info():
+    """Get current process metrics"""
+    try:
+        process = psutil.Process()
+        return {
+            'memory_usage': process.memory_info().rss / 1024 / 1024,  # MB
+            'cpu_usage': process.cpu_percent(),
+            'threads': process.num_threads(),
+            'uptime': str(timedelta(seconds=int(time.time() - process.create_time())))
+        }
+    except Exception as e:
+        logging.error(f"Error getting process info: {str(e)}")
+        return None
+
 def main():
     # Initialize session state at the very beginning
     initialize_session_state()
@@ -1143,9 +1217,22 @@ def main():
     
     # Sidebar navigation
     st.sidebar.title("🛡️ Network IDS")
+    
+    # Add System Health to the available pages
+    if 'pages' not in st.session_state:
+        st.session_state.pages = [
+            "Dashboard", 
+            "Real-time Monitoring",
+            "Batch Analysis",
+            "Reports & Analytics",
+            "Network Visualization",
+            "System Health",  # Add this line
+            "System Settings"
+        ]
+    
     page = st.sidebar.selectbox(
         "Navigation",
-        ["Dashboard", "Model Training", "Real-time Monitoring", "Batch Analysis", "System Settings", "Reports & Analytics", "Network Visualization"]
+        st.session_state.pages
     )
     
     # Add new pages to navigation
@@ -1952,6 +2039,309 @@ def main():
             No data available for visualization. 
             Please run monitoring or batch analysis first to generate traffic data.
             """)
+
+    elif page == "System Health":
+        st.title("🖥️ System Health Monitor")
+        
+        # Initialize logging if not already done
+        logger = setup_logging()
+        
+        # Load model
+        model, scaler = load_model()
+        
+        # Get current metrics once to use across all tabs
+        metrics = get_system_metrics()
+        process_info = get_process_info()
+        
+        # Custom CSS for better styling with updated colors
+        st.markdown("""
+            <style>
+            .metric-container {
+                background-color: #262730;
+                border-radius: 10px;
+                padding: 20px;
+                margin: 10px 0;
+                color: white;
+            }
+            .metric-row {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 10px;
+            }
+            .status-card {
+                background-color: #262730;
+                border-radius: 8px;
+                padding: 15px;
+                margin: 10px 0;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                color: white;
+            }
+            .chart-container {
+                background-color: #262730;
+                border-radius: 10px;
+                padding: 20px;
+                margin: 10px 0;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                color: white;
+            }
+            .custom-metric {
+                text-align: center;
+                padding: 15px;
+                background-color: #262730;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                color: white;
+            }
+            .log-container {
+                background-color: #1e1e1e;
+                border-radius: 8px;
+                padding: 15px;
+                margin: 10px 0;
+                color: white;
+            }
+            .metric-value {
+                font-size: 24px;
+                font-weight: bold;
+                margin: 10px 0;
+            }
+            .metric-label {
+                font-size: 14px;
+                color: #c2c2c2;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        
+        # Create tabs with custom styling
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📊 Resource Usage", 
+            "📈 Performance", 
+            "🔌 Services", 
+            "📝 Logs"
+        ])
+        
+        with tab1:
+            st.markdown("### 📊 Real-time Resource Monitor")
+            
+            if metrics and process_info:
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    cpu_color = "#ff4b4b" if metrics['cpu_percent'] > 80 else "#faa356" if metrics['cpu_percent'] > 60 else "#2ea043"
+                    st.markdown(f"""
+                        <div class="custom-metric">
+                            <div class="metric-value" style="color: {cpu_color};">{metrics['cpu_percent']}%</div>
+                            <div class="metric-label">CPU Usage</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    
+                with col2:
+                    mem_color = "#ff4b4b" if metrics['memory_percent'] > 80 else "#faa356" if metrics['memory_percent'] > 60 else "#2ea043"
+                    st.markdown(f"""
+                        <div class="custom-metric">
+                            <div class="metric-value" style="color: {mem_color};">{metrics['memory_percent']}%</div>
+                            <div class="metric-label">Memory Usage</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    
+                with col3:
+                    disk_color = "#ff4b4b" if metrics['disk_usage'] > 90 else "#faa356" if metrics['disk_usage'] > 70 else "#2ea043"
+                    st.markdown(f"""
+                        <div class="custom-metric">
+                            <div class="metric-value" style="color: {disk_color};">{metrics['disk_usage']}%</div>
+                            <div class="metric-label">Disk Usage</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Application Metrics Section with updated styling
+                st.markdown("### 🔍 Application Metrics")
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("""
+                        <div class="custom-metric">
+                            <div class="metric-label">Memory & Threads</div>
+                    """, unsafe_allow_html=True)
+                    st.metric("App Memory", f"{process_info['memory_usage']:.1f} MB")
+                    st.metric("Active Threads", process_info['threads'])
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown("""
+                        <div class="custom-metric">
+                            <div class="metric-label">Performance</div>
+                    """, unsafe_allow_html=True)
+                    st.metric("App CPU", f"{process_info['cpu_usage']:.1f}%")
+                    st.metric("Uptime", process_info['uptime'])
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+        
+        with tab2:
+            st.markdown("### 📈 Performance Analysis")
+            
+            st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+            # Update performance history
+            if 'performance_history' not in st.session_state:
+                st.session_state.performance_history = {
+                    'timestamps': [],
+                    'cpu': [],
+                    'memory': []
+                }
+            
+            current_time = datetime.now()
+            st.session_state.performance_history['timestamps'].append(current_time)
+            st.session_state.performance_history['cpu'].append(metrics['cpu_percent'])
+            st.session_state.performance_history['memory'].append(metrics['memory_percent'])
+            
+            # Keep only last 60 data points
+            max_points = 60
+            if len(st.session_state.performance_history['timestamps']) > max_points:
+                st.session_state.performance_history['timestamps'] = st.session_state.performance_history['timestamps'][-max_points:]
+                st.session_state.performance_history['cpu'] = st.session_state.performance_history['cpu'][-max_points:]
+                st.session_state.performance_history['memory'] = st.session_state.performance_history['memory'][-max_points:]
+            
+            # Create performance chart with improved styling
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=st.session_state.performance_history['timestamps'],
+                y=st.session_state.performance_history['cpu'],
+                name="CPU Usage",
+                line=dict(color="#00ff00", width=2),
+                fill='tozeroy',
+                fillcolor='rgba(0, 255, 0, 0.1)'
+            ))
+            fig.add_trace(go.Scatter(
+                x=st.session_state.performance_history['timestamps'],
+                y=st.session_state.performance_history['memory'],
+                name="Memory Usage",
+                line=dict(color="#ff0000", width=2),
+                fill='tozeroy',
+                fillcolor='rgba(255, 0, 0, 0.1)'
+            ))
+            
+            fig.update_layout(
+                title="Resource Usage Trends",
+                xaxis_title="Time",
+                yaxis_title="Usage (%)",
+                height=400,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # System Information with improved styling
+            st.markdown("### 💻 System Information")
+            st.markdown('<div class="status-card">', unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"""
+                    - **Python Version:** {metrics['python_version']}
+                    - **Platform:** {metrics['system_platform']}
+                """)
+            with col2:
+                st.markdown(f"""
+                    - **Processor:** {metrics['processor']}
+                    - **Boot Time:** {metrics['boot_time']}
+                """)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with tab3:
+            st.markdown("### 🔌 Service Status")
+            
+            # Monitor critical services with improved styling
+            services = {
+                "IDS Model": model is not None,
+                "Database": True,
+                "Monitoring": st.session_state.get('monitoring_active', False),
+                "Logging": os.path.exists('logs/system_health.log')
+            }
+            
+            st.markdown('<div class="status-card">', unsafe_allow_html=True)
+            for service, status in services.items():
+                if status:
+                    st.markdown(f"""
+                        <div style="display: flex; align-items: center; margin: 10px 0;">
+                            <span style="color: #00cc00; font-size: 24px;">●</span>
+                            <span style="margin-left: 10px;">{service}: Running</span>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                        <div style="display: flex; align-items: center; margin: 10px 0;">
+                            <span style="color: #ff0000; font-size: 24px;">●</span>
+                            <span style="margin-left: 10px;">{service}: Not Running</span>
+                        </div>
+                    """, unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Network I/O with improved styling
+            st.markdown("### 🌐 Network Activity")
+            st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+            network = metrics['network_io']
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("""
+                    <div class="custom-metric">
+                        <h4>Data Sent</h4>
+                """, unsafe_allow_html=True)
+                st.metric("Total", f"{network.bytes_sent/1024/1024:.2f} MB")
+                st.markdown('</div>', unsafe_allow_html=True)
+            with col2:
+                st.markdown("""
+                    <div class="custom-metric">
+                        <h4>Data Received</h4>
+                """, unsafe_allow_html=True)
+                st.metric("Total", f"{network.bytes_recv/1024/1024:.2f} MB")
+                st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with tab4:
+            st.markdown("### 📝 System Logs")
+            
+            # Add log level filter with improved styling
+            log_level = st.selectbox(
+                "Filter Logs by Level",
+                ["ALL", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                help="Select the log level to filter the displayed logs"
+            )
+            
+            st.markdown('<div class="log-container">', unsafe_allow_html=True)
+            if os.path.exists('logs/system_health.log'):
+                with open('logs/system_health.log', 'r') as f:
+                    logs = f.readlines()
+                
+                if log_level != "ALL":
+                    logs = [log for log in logs if log_level in log]
+                
+                if logs:
+                    st.code("".join(logs), language="text")
+                else:
+                    st.info("No logs found for the selected level.")
+            else:
+                st.warning("No logs found. The logging system will create logs as events occur.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Log management buttons with improved styling
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Clear Logs", type="secondary"):
+                    try:
+                        open('logs/system_health.log', 'w').close()
+                        st.success("Logs cleared successfully")
+                    except Exception as e:
+                        st.error(f"Error clearing logs: {str(e)}")
+            with col2:
+                if st.button("🔄 Refresh Logs", type="primary"):
+                    st.rerun()
 
     # Handle new pages
     if st.session_state.get('current_page') == "change_password":
