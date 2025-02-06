@@ -8,6 +8,7 @@ class UserRole(Enum):
     ANALYST = "analyst"      # Can view dashboards and analyze data
     OPERATOR = "operator"    # Can view dashboards only
     AUDITOR = "auditor"      # Can view logs and reports
+    USER = "user"
 
 class Permission(Enum):
     VIEW_DASHBOARD = "view_dashboard"
@@ -34,7 +35,8 @@ ROLE_PERMISSIONS = {
     UserRole.AUDITOR: [
         Permission.VIEW_DASHBOARD,
         Permission.VIEW_REPORTS
-    ]
+    ],
+    UserRole.USER: []
 }
 
 class PasswordError(Exception):
@@ -53,39 +55,35 @@ def check_password_strength(password):
     if not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
         raise PasswordError("Password must contain at least one special character")
 
-def change_password(username, old_password, new_password):
-    """Change user password with validation"""
+def change_password(username, current_password, new_password):
+    """Change user password"""
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
     
-    # Verify old password
-    c.execute('SELECT password_hash FROM users WHERE username = ?', (username,))
-    result = c.fetchone()
+    # Verify current password
+    hashed_current = hashlib.sha256(current_password.encode()).hexdigest()
+    c.execute('SELECT * FROM users WHERE username = ? AND password_hash = ?',
+              (username, hashed_current))
     
-    if not result or not verify_password(result[0], old_password):
+    if not c.fetchone():
         conn.close()
         return False, "Current password is incorrect"
     
-    try:
-        # Check password strength
-        check_password_strength(new_password)
-        
-        # Update password
-        new_password_hash = hash_password(new_password)
-        c.execute(
-            'UPDATE users SET password_hash = ? WHERE username = ?',
-            (new_password_hash, username)
-        )
-        conn.commit()
-        return True, "Password updated successfully"
-    except PasswordError as e:
-        return False, str(e)
-    finally:
-        conn.close()
+    # Update to new password
+    hashed_new = hashlib.sha256(new_password.encode()).hexdigest()
+    c.execute('UPDATE users SET password_hash = ? WHERE username = ?',
+              (hashed_new, username))
+    
+    conn.commit()
+    conn.close()
+    return True, "Password changed successfully"
 
 def init_db():
+    """Initialize the database with default users"""
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
+    
+    # Create users table if not exists with all required fields
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
@@ -96,11 +94,12 @@ def init_db():
             failed_attempts INTEGER DEFAULT 0,
             last_failed_attempt TIMESTAMP,
             account_locked BOOLEAN DEFAULT 0,
-            last_password_change TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            last_password_change TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            totp_secret TEXT
         )
     ''')
     
-    # Create login attempts table
+    # Create login attempts table if not exists
     c.execute('''
         CREATE TABLE IF NOT EXISTS login_attempts (
             id INTEGER PRIMARY KEY,
@@ -110,6 +109,27 @@ def init_db():
             ip_address TEXT
         )
     ''')
+    
+    # Add default users if they don't exist
+    default_users = [
+        ('admin', 'changeme123', 'admin'),
+        ('analyst', 'analyst123', 'analyst'),
+        ('user', 'user123', 'user')
+    ]
+    
+    for username, password, role in default_users:
+        # Hash the password
+        hashed_password = hashlib.sha256(password.encode()).hexdigest()
+        
+        # Check if user exists
+        c.execute('SELECT * FROM users WHERE username = ?', (username,))
+        if not c.fetchone():
+            c.execute('''
+                INSERT INTO users 
+                (username, password_hash, role) 
+                VALUES (?, ?, ?)
+            ''', (username, hashed_password, role))
+    
     conn.commit()
     conn.close()
 
@@ -192,16 +212,66 @@ def create_user(username, password, role):
         conn.close()
 
 def verify_user(username, password):
+    """Verify user credentials and return role if valid"""
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    c.execute('SELECT password_hash, role FROM users WHERE username = ?', (username,))
+    
+    # Hash the provided password
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    
+    # Get user with matching credentials
+    c.execute('SELECT role FROM users WHERE username = ? AND password_hash = ?',
+              (username, hashed_password))
     result = c.fetchone()
+    
     conn.close()
     
-    if result and verify_password(result[0], password):
-        return result[1]  # Return user role
+    if result:
+        return result[0]  # Return the role
     return None
 
-def has_permission(role, permission):
-    user_role = UserRole(role)
-    return permission in ROLE_PERMISSIONS[user_role] 
+def store_totp_secret(username, secret):
+    """Store TOTP secret for a user"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    
+    c.execute('UPDATE users SET totp_secret = ? WHERE username = ?',
+              (secret, username))
+    
+    conn.commit()
+    conn.close()
+
+def get_totp_secret(username):
+    """Get stored TOTP secret for a user"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    
+    c.execute('SELECT totp_secret FROM users WHERE username = ?', (username,))
+    result = c.fetchone()
+    
+    conn.close()
+    return result[0] if result else None
+
+def has_permission(username, required_role):
+    """Check if user has required role permission"""
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    
+    c.execute('SELECT role FROM users WHERE username = ?', (username,))
+    result = c.fetchone()
+    
+    conn.close()
+    
+    if not result:
+        return False
+        
+    user_role = result[0]
+    
+    # Define role hierarchy
+    role_hierarchy = {
+        'admin': ['admin', 'analyst', 'user'],
+        'analyst': ['analyst', 'user'],
+        'user': ['user']
+    }
+    
+    return required_role in role_hierarchy.get(user_role, []) 

@@ -1193,6 +1193,10 @@ def main():
         login_page()
         return
 
+    # Add route for index page
+    if st.session_state.get('current_page') == 'index':
+        return render_template('index.html')
+
     st.set_page_config(page_title="Network IDS", page_icon="🛡️", layout="wide")
     
     # Add custom CSS
@@ -1215,34 +1219,41 @@ def main():
         </style>
     """, unsafe_allow_html=True)
     
-    # Sidebar navigation
+    # Sidebar navigation - Remove Change Password and 2FA buttons from here
     st.sidebar.title("🛡️ Network IDS")
     
-    # Add System Health to the available pages
-    if 'pages' not in st.session_state:
-        st.session_state.pages = [
+    # Define role-based page access
+    role_pages = {
+        'admin': [
             "Dashboard", 
             "Model Training",
             "Real-time Monitoring",
             "Batch Analysis",
             "Reports & Analytics",
             "Network Visualization",
-            "System Health",  # Add this line
+            "System Health",
             "System Settings"
+        ],
+        'analyst': [
+            "Dashboard",
+            "Real-time Monitoring",
+            "Batch Analysis",
+            "Reports & Analytics",
+            "Network Visualization"
+        ],
+        'user': [
+            "Dashboard",
+            "Real-time Monitoring"
         ]
+    }
+    
+    # Get available pages based on user role
+    available_pages = role_pages.get(st.session_state.role, ['Dashboard'])
     
     page = st.sidebar.selectbox(
         "Navigation",
-        st.session_state.pages
+        available_pages
     )
-    
-    # Add new pages to navigation
-    with st.sidebar:
-        if st.session_state.authenticated:
-            if st.button("Change Password"):
-                st.session_state.current_page = "change_password"
-            if st.button("Setup 2FA"):
-                st.session_state.current_page = "setup_2fa"
     
     if page == "Dashboard":
         st.title("🛡️ Network Intrusion Detection Dashboard")
@@ -1779,6 +1790,56 @@ def main():
     elif page == "System Settings":
         st.title("System Settings")
         
+        # Only show these sections to admin users
+        if st.session_state.role == 'admin':
+            st.subheader("Security Settings")
+            security_tab1, security_tab2 = st.tabs(["Password Management", "Two-Factor Authentication"])
+            
+            with security_tab1:
+                with st.form("change_password_form"):
+                    current_password = st.text_input("Current Password", type="password")
+                    new_password = st.text_input("New Password", type="password")
+                    confirm_password = st.text_input("Confirm New Password", type="password")
+                    submitted = st.form_submit_button("Change Password")
+                    
+                    if submitted:
+                        if new_password != confirm_password:
+                            st.error("New passwords don't match!")
+                            return
+                            
+                        success, message = change_password(
+                            st.session_state.username,
+                            current_password,
+                            new_password
+                        )
+                        
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
+            
+            with security_tab2:
+                if 'totp_secret' not in st.session_state:
+                    st.session_state.totp_secret = generate_totp_secret()
+                
+                # Generate QR code
+                uri = generate_totp_uri(st.session_state.username, st.session_state.totp_secret)
+                qr_code = generate_qr_code(uri)
+                
+                st.markdown("### Setup Two-Factor Authentication")
+                st.markdown("Use your authenticator app (like Google Authenticator) to scan this QR code:")
+                st.image(f"data:image/png;base64,{qr_code}")
+                
+                with st.form("verify_2fa"):
+                    token = st.text_input("Enter the code from your authenticator app")
+                    submitted = st.form_submit_button("Verify")
+                    
+                    if submitted:
+                        if verify_totp(st.session_state.totp_secret, token):
+                            st.success("2FA setup successful!")
+                        else:
+                            st.error("Invalid code. Please try again.")
+        
         st.subheader("Model Configuration")
         st.slider("Detection Sensitivity", 0.0, 1.0, 0.8)
         st.checkbox("Enable Automatic Updates")
@@ -1788,14 +1849,15 @@ def main():
         st.checkbox("SMS Alerts")
         st.text_input("Alert Email Address")
         
-        st.subheader("System Maintenance")
-        if st.button("Clear Alert History"):
-            if 'alerts' in st.session_state:
-                st.session_state.alerts = []
-            st.success("Alert history cleared!")
-        
-        if st.button("Export System Logs"):
-            st.info("System logs exported successfully!")
+        if st.session_state.role == 'admin':
+            st.subheader("System Maintenance")
+            if st.button("Clear Alert History"):
+                if 'alerts' in st.session_state:
+                    st.session_state.alerts = []
+                st.success("Alert history cleared!")
+            
+            if st.button("Export System Logs"):
+                st.info("System logs exported successfully!")
 
     elif page == "Reports & Analytics":
         st.title("Reports & Analytics Dashboard")
@@ -2343,12 +2405,6 @@ def main():
             with col2:
                 if st.button("🔄 Refresh Logs", type="primary"):
                     st.rerun()
-
-    # Handle new pages
-    if st.session_state.get('current_page') == "change_password":
-        change_password_page()
-    elif st.session_state.get('current_page') == "setup_2fa":
-        setup_2fa()
 
 if __name__ == "__main__":
     main()
