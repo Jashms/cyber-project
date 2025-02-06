@@ -1222,6 +1222,7 @@ def main():
     if 'pages' not in st.session_state:
         st.session_state.pages = [
             "Dashboard", 
+            "Model Training",
             "Real-time Monitoring",
             "Batch Analysis",
             "Reports & Analytics",
